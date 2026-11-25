@@ -1,1 +1,5 @@
 node_modules/
+
+# Sensitive reference archives must not be committed again
+Ghost_Scramjet_Backend_AGPL_SRC.zip
+ghost_proxy_frontend_node.zip
