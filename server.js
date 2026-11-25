@@ -1,11 +1,15 @@
 import http from "node:http";
 import https from "node:https";
-import dns from "node:dns";
 import net from "node:net";
+import tls from "node:tls";
 import zlib from "node:zlib";
 import { promisify } from "node:util";
 import { pipeline } from "node:stream";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { ProxyError, ERRORS, classifyError } from "./src/errors.js";
+import { guardedLookup, checkTarget } from "./src/security.js";
+import { checkRateLimit } from "./src/rateLimit.js";
+import { validateSetCookies } from "./src/cookies.js";
 
 const PASSWORD = process.env.PROXY_PASSWORD;
 if (!PASSWORD) {
@@ -116,55 +120,14 @@ const sharedSource = [encodeTarget, decodeTarget, isProxiedPath, proxify, target
 const preamble = `const PREFIX = ${JSON.stringify(PREFIX)};\n${sharedSource}\n`;
 
 /* ==========================================================================
-   2. Errors
+   2. Errors (ProxyError/ERRORS/classifyError live in src/errors.js)
    ========================================================================== */
-
-class ProxyError extends Error {
-  constructor(code, detail) {
-    super(detail || code);
-    this.proxyCode = code;
-  }
-}
-
-// code: [HTTP status, title, what happened, things to try]
-const ERRORS = {
-  bad_url: [400, "That address is not valid", "The proxy could not understand the web address it was given.",
-    ["Check the address for typos.", "Start again from the home page."]],
-  blocked: [403, "That address is not allowed", "The proxy refuses to connect to private or internal addresses, or to itself.",
-    ["Use the site's public address."]],
-  dns: [502, "Site not found", "The site's name could not be looked up.",
-    ["Check the spelling of the address.", "The site may be down, or the domain may not exist."]],
-  refused: [502, "The site refused the connection", "The site's server is reachable but is not accepting connections.",
-    ["Try again in a minute.", "Check that the address uses the right port."]],
-  reset: [502, "The connection dropped", "The site closed the connection before finishing its reply.",
-    ["Reload the page.", "If it keeps happening, the site may be rejecting this proxy."]],
-  timeout: [504, "The site took too long", "The site did not answer within 30 seconds.",
-    ["Reload the page.", "The site may be slow or down."]],
-  tls: [502, "Security certificate problem", "The proxy could not verify the site's HTTPS certificate.",
-    ["The site's certificate may be expired or misconfigured. The proxy will not load it."]],
-  too_large: [502, "Page too large to process", "This response is bigger than the 20 MB the proxy will rewrite.",
-    ["Open the file directly instead of through a page that needs rewriting."]],
-  encoding: [502, "Unsupported compression", "The site used a compression format the proxy cannot read.", []],
-  unknown: [502, "Something went wrong", "The proxy hit an unexpected error while loading this page.",
-    ["Reload the page.", "Open the request log on the home page and look for this request."]],
-};
-
-function classifyError(err) {
-  if (err instanceof ProxyError) return err.proxyCode;
-  const code = (err && err.code) || "";
-  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
-  if (code === "ECONNREFUSED") return "refused";
-  if (code === "ECONNRESET" || code === "EPIPE" || code === "ERR_STREAM_PREMATURE_CLOSE") return "reset";
-  if (code === "ETIMEDOUT") return "timeout";
-  if (/CERT|TLS|SSL|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code)) return "tls";
-  return "unknown";
-}
 
 function sendError(res, wantsPage, code, err) {
   const [status, title, what, fixes] = ERRORS[code] || ERRORS.unknown;
   const detail = `${code}: ${err.message}`;
   console.error("Proxy request failed:", detail);
-  const headers = { "x-proxy-error": code, "cache-control": "no-store" };
+  const headers = { "x-proxy-error": code, "cache-control": "no-store", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'" };
   if (wantsPage) {
     res.writeHead(status, { ...headers, "content-type": "text/html; charset=utf-8" });
     res.end(renderErrorPage({ title, what, fixes, detail }));
@@ -175,52 +138,11 @@ function sendError(res, wantsPage, code, err) {
 }
 
 /* ==========================================================================
-   3. Network safety: refuse private addresses
+   3. Network safety: refuse private addresses (src/security.js)
    ========================================================================== */
-
-function isPrivate(ip) {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    return (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      a >= 224
-    );
-  }
-  const v = ip.toLowerCase();
-  // IPv4-mapped IPv6 can hide a private IPv4 address, so reject the whole range.
-  return v === "::1" || v === "::" || v.startsWith("::ffff:") ||
-    v.startsWith("fc") || v.startsWith("fd") || v.startsWith("fe80");
-}
-
-// Used as the socket's DNS lookup, so the address that is checked is the address that is connected to.
-function guardedLookup(hostname, options, callback) {
-  dns.lookup(hostname, { ...options, all: true }, (error, addresses) => {
-    if (error) return callback(error);
-    const allowed = addresses.filter((entry) => !isPrivate(entry.address));
-    if (allowed.length === 0) {
-      return callback(new ProxyError("blocked", `${hostname} resolves to a private address`));
-    }
-    if (options.all) return callback(null, allowed);
-    callback(null, allowed[0].address, allowed[0].family);
-  });
-}
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64, lookup: guardedLookup });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64, lookup: guardedLookup });
-
-// Hostnames are checked by guardedLookup; IP literals skip DNS, so they are checked here.
-function checkTarget(target, req) {
-  if (target.protocol !== "http:" && target.protocol !== "https:") {
-    throw new ProxyError("bad_url", "Only http and https addresses are supported.");
-  }
-  const host = target.hostname.replace(/^\[|\]$/g, "");
-  if (net.isIP(host) && isPrivate(host)) throw new ProxyError("blocked", `${host} is a private address`);
-  if (target.host === req.headers.host) throw new ProxyError("blocked", "The proxy cannot load itself.");
-}
 
 /* ==========================================================================
    4. Login session
@@ -522,23 +444,46 @@ async function handleService(req, res, url) {
   }
 }
 
+const MAX_REDIRECTS = 10;
+
+function cspModeFor(target) {
+  const mode = (process.env.PROXY_CSP_MODE || "drop").toLowerCase();
+  if (mode !== "rewrite") return "drop";
+  const allow = (process.env.PROXY_CSP_ALLOW || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (allow.length === 0) return "rewrite";
+  return allow.some((h) => target.hostname.toLowerCase() === h || target.hostname.toLowerCase().endsWith("." + h)) ? "rewrite" : "drop";
+}
+
 async function respond(req, res, target, upstream, entry) {
   const status = upstream.statusCode;
   entry.status = status;
   const out = {};
 
   const setCookies = upstream.headers["set-cookie"];
-  if (setCookies?.length) out["x-proxy-set-cookie"] = encodeURIComponent(JSON.stringify(setCookies));
+  if (setCookies?.length) {
+    const valid = await validateSetCookies(target.href, setCookies);
+    if (valid.length) out["x-proxy-set-cookie"] = encodeURIComponent(JSON.stringify(valid));
+  }
 
   // Redirects become a normal reply with extra headers. The service worker turns them back
   // into real redirects after saving any cookies the redirect set.
   if (REDIRECTS.has(status) && upstream.headers.location) {
     upstream.resume();
+    const count = Number(req.headers["x-proxy-redirect-count"] || 0);
+    if (count >= MAX_REDIRECTS) throw new ProxyError("too_many_redirects", `redirect loop detected after ${count} hops`);
     const proxied = proxify(upstream.headers.location, target.href);
     if (proxied === null) throw new ProxyError("bad_url", "The site redirected to an address the proxy cannot follow.");
+    // Loop detection: redirect back to the exact same target.
+    try {
+      const nextTarget = targetFromPath(new URL(proxied, "http://localhost").pathname, new URL(proxied, "http://localhost").search, null);
+      if (nextTarget && nextTarget.href === target.href) throw new ProxyError("too_many_redirects", "redirect loop to same address");
+    } catch (e) {
+      if (e instanceof ProxyError) throw e;
+    }
     out["x-proxy-redirect"] = String(status);
     out["x-proxy-location"] = proxied;
-    entry.note = `redirect ${status}`;
+    out["x-proxy-redirect-count"] = String(count + 1);
+    entry.note = `redirect ${status} (${count + 1}/${MAX_REDIRECTS})`;
     res.writeHead(200, { ...out, "cache-control": "no-store" });
     return res.end();
   }
@@ -548,6 +493,14 @@ async function respond(req, res, target, upstream, entry) {
 
   for (const name of PASS_RESPONSE) {
     if (upstream.headers[name] !== undefined) out[name] = upstream.headers[name];
+  }
+
+  // CSP: default drop (not in PASS_RESPONSE). Rewrite mode replaces with a
+  // permissive policy so sites that require inline scripts can load.
+  const upstreamCsp = upstream.headers["content-security-policy"] || upstream.headers["content-security-policy-report-only"];
+  if (upstreamCsp && cspModeFor(target) === "rewrite") {
+    out["content-security-policy"] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src 'self' data: blob:; img-src 'self' data: blob:; media-src 'self' data: blob:; frame-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'";
+    if (!entry.note) entry.note = "CSP rewritten (permissive)";
   }
 
   const contentType = upstream.headers["content-type"] || "";
@@ -594,6 +547,8 @@ async function respond(req, res, target, upstream, entry) {
 function swMain() {
   const INTERNAL = new Set(["/", "/sw.js", "/runtime.js", "/login", "/logout", "/debug", "/debug.json", "/favicon.ico"]);
   const DAY = 86400000;
+  // Redirect hop counts per target URL (cleared on non-redirect responses).
+  const redirectCounts = new Map();
 
   // Cookie jar: lives in the browser, so logins survive server restarts and the server never stores them.
   const database = new Promise((resolve, reject) => {
@@ -751,6 +706,9 @@ function swMain() {
       const cookie = await cookieHeader(target);
       if (cookie) headers.set("x-proxy-cookie", cookie);
       if (context) headers.set("x-proxy-referer", context);
+      // Redirect hop count: carried in SW memory across navigations.
+      const priorCount = redirectCounts.get(target.href) || 0;
+      if (priorCount > 0) headers.set("x-proxy-redirect-count", String(priorCount));
 
       const init = { method: request.method, headers };
       if (request.method !== "GET" && request.method !== "HEAD") init.body = await request.arrayBuffer();
@@ -764,8 +722,13 @@ function swMain() {
       const redirectStatus = response.headers.get("x-proxy-redirect");
       if (redirectStatus) {
         const location = new URL(response.headers.get("x-proxy-location"), self.location.origin).href;
+        const nextCount = Number(response.headers.get("x-proxy-redirect-count") || priorCount + 1);
+        redirectCounts.set(target.href, nextCount);
+        // Also key the next URL so the follow-up navigation carries the count.
+        try { redirectCounts.set(new URL(location).href, nextCount); } catch { /* ignore */ }
         return Response.redirect(location, Number(redirectStatus));
       }
+      redirectCounts.delete(target.href);
       if (response.status === 401 && response.headers.get("x-proxy-error") === "auth" && isPage) {
         return Response.redirect(new URL("/login?next=" + encodeURIComponent(url.pathname + url.search), self.location.origin).href, 302);
       }
@@ -871,6 +834,80 @@ function runtimeMain() {
     };
   }
 
+  // location.assign/replace bypass history hooks.
+  try {
+    const nativeAssign = location.assign.bind(location);
+    const nativeReplace = location.replace.bind(location);
+    location.assign = (url) => nativeAssign(px(url));
+    location.replace = (url) => nativeReplace(px(url));
+  } catch { /* location not hookable */ }
+
+  // form.submit() bypasses action setter hooks.
+  try {
+    const nativeSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function () {
+      const action = this.getAttribute("action");
+      if (action) {
+        const rewritten = px(action);
+        if (rewritten !== action) nativeSetAttribute.call(this, "action", rewritten);
+      }
+      return nativeSubmit.call(this);
+    };
+  } catch { /* forms not hookable */ }
+
+  // EventSource (server-sent events) does not use fetch/XHR.
+  if (window.EventSource) {
+    const NativeEventSource = window.EventSource;
+    window.EventSource = function (url, init) {
+      return new NativeEventSource(px(url), init);
+    };
+    window.EventSource.prototype = NativeEventSource.prototype;
+  }
+
+  // Workers load scripts directly; rewrite their URLs through the proxy.
+  if (window.Worker) {
+    const NativeWorker = window.Worker;
+    window.Worker = function (url, options) {
+      return new NativeWorker(px(url), options);
+    };
+    window.Worker.prototype = NativeWorker.prototype;
+  }
+  if (window.SharedWorker) {
+    const NativeSharedWorker = window.SharedWorker;
+    window.SharedWorker = function (url, options) {
+      return new NativeSharedWorker(px(url), options);
+    };
+    window.SharedWorker.prototype = NativeSharedWorker.prototype;
+  }
+
+  // WebSocket: rewrite ws(s):// URLs to the proxy origin so Node can upgrade.
+  // Node's upgrade handler decodes /service/<token> and tunnels to the target.
+  if (window.WebSocket) {
+    const NativeWebSocket = window.WebSocket;
+    const pxWs = (value) => {
+      const base = current();
+      if (base === null || value === null || value === undefined) return value;
+      let url;
+      try { url = new URL(String(value), base); } catch { return value; }
+      if (url.protocol !== "ws:" && url.protocol !== "wss:") return value;
+      const httpProto = url.protocol === "wss:" ? "https:" : "http:";
+      const httpUrl = new URL(url.href);
+      httpUrl.protocol = httpProto;
+      const out = proxify(httpUrl.href, base, ORIGIN);
+      if (out === null) return value;
+      const proxyProto = location.protocol === "https:" ? "wss:" : "ws:";
+      return proxyProto + "//" + location.host + out + url.search;
+    };
+    window.WebSocket = function (url, protocols) {
+      return protocols === undefined ? new NativeWebSocket(pxWs(url)) : new NativeWebSocket(pxWs(url), protocols);
+    };
+    window.WebSocket.prototype = NativeWebSocket.prototype;
+    window.WebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+    window.WebSocket.OPEN = NativeWebSocket.OPEN;
+    window.WebSocket.CLOSING = NativeWebSocket.CLOSING;
+    window.WebSocket.CLOSED = NativeWebSocket.CLOSED;
+  }
+
   const nativeSetAttribute = Element.prototype.setAttribute;
   const URL_ATTRIBUTES = ["src", "href", "poster", "action", "data"];
   Element.prototype.setAttribute = function (name, value) {
@@ -921,6 +958,57 @@ function runtimeMain() {
   if (navigator.serviceWorker) {
     navigator.serviceWorker.register = () =>
       Promise.reject(new Error("Service workers are disabled on proxied pages."));
+  }
+
+  // --- Origin-isolated storage shim -------------------------------------
+  // All proxied sites share the proxy origin, so raw localStorage/IndexedDB
+  // would leak across sites. Namespace every key/db by target origin.
+  // Limitation: document.cookie still shares the proxy origin; the SW cookie
+  // jar isolates network cookies, but page JS reading document.cookie sees
+  // only the proxy's own cookies (sites get cookies via the SW header).
+  const siteOrigin = () => {
+    const base = current();
+    try { return base ? new URL(base).origin : "unknown"; } catch { return "unknown"; }
+  };
+  const ns = (key) => siteOrigin() + "|" + String(key);
+  const wrapStorage = (native) => {
+    if (!native) return native;
+    const ownKeys = () => {
+      const prefix = siteOrigin() + "|";
+      const out = [];
+      for (let i = 0; i < native.length; i++) {
+        const k = native.key(i);
+        if (k && k.startsWith(prefix)) out.push(k.slice(prefix.length));
+      }
+      return out;
+    };
+    return {
+      get length() { return ownKeys().length; },
+      getItem: (k) => native.getItem(ns(k)),
+      setItem: (k, v) => native.setItem(ns(k), String(v)),
+      removeItem: (k) => native.removeItem(ns(k)),
+      clear: () => { for (const k of ownKeys()) native.removeItem(siteOrigin() + "|" + k); },
+      key: (i) => ownKeys()[i] ?? null,
+    };
+  };
+  try {
+    const nativeLocal = window.localStorage;
+    Object.defineProperty(window, "localStorage", { value: wrapStorage(nativeLocal), configurable: true });
+  } catch { /* storage blocked */ }
+  try {
+    const nativeSession = window.sessionStorage;
+    Object.defineProperty(window, "sessionStorage", { value: wrapStorage(nativeSession), configurable: true });
+  } catch { /* storage blocked */ }
+  if (window.indexedDB) {
+    const nativeOpen = window.indexedDB.open.bind(window.indexedDB);
+    const nativeDelete = window.indexedDB.deleteDatabase.bind(window.indexedDB);
+    window.indexedDB.open = (name, version) =>
+      version === undefined ? nativeOpen(siteOrigin() + "|" + String(name)) : nativeOpen(siteOrigin() + "|" + String(name), version);
+    window.indexedDB.deleteDatabase = (name) => nativeDelete(siteOrigin() + "|" + String(name));
+  }
+  if (window.caches) {
+    const nativeOpenCache = window.caches.open.bind(window.caches);
+    window.caches.open = (name) => nativeOpenCache(siteOrigin() + "|" + String(name));
   }
 }
 
@@ -1176,6 +1264,9 @@ const SECURITY = {
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
+  // Home/login/debug/error pages use inline <script>/<style>, so unsafe-inline is required there.
+  // Proxied pages never get this header: upstream CSP is intentionally dropped (not in PASS_RESPONSE).
+  "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
 };
 
 function sendHtml(res, html, status = 200) {
@@ -1184,13 +1275,18 @@ function sendHtml(res, html, status = 200) {
 }
 
 function sendScript(res, source) {
-  res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff" });
+  res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'" });
   res.end(source);
 }
 
 async function handleLogin(req, res, url) {
   const next = safeNext(url.searchParams.get("next"));
   if (req.method === "POST") {
+    const rl = checkRateLimit(req, { limit: 20, windowMs: 60_000 });
+    if (!rl.allowed) {
+      res.writeHead(429, { "retry-after": String(rl.retryAfter), "content-type": "text/plain; charset=utf-8" });
+      return res.end("Too many requests. Try again later.");
+    }
     if (loginLocked()) return sendHtml(res, loginPage("/", "Too many wrong passwords. Wait a few minutes and try again."), 429);
     const form = new URLSearchParams(await readSmallBody(req));
     const destination = safeNext(form.get("next"));
@@ -1227,7 +1323,14 @@ async function route(req, res) {
     return res.end();
   }
 
-  if (path.startsWith(PREFIX)) return handleService(req, res, url);
+  if (path.startsWith(PREFIX)) {
+    const rl = checkRateLimit(req, { limit: 300, windowMs: 60_000 });
+    if (!rl.allowed) {
+      res.writeHead(429, { "retry-after": String(rl.retryAfter), "content-type": "text/plain; charset=utf-8", "x-proxy-error": "rate_limited" });
+      return res.end("Too many requests. Try again later.");
+    }
+    return handleService(req, res, url);
+  }
 
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.writeHead(405);
@@ -1259,6 +1362,48 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
     res.end("Internal error");
   });
+});
+
+// WebSocket upgrade tunneling: ws(s)://proxy/service/<token> -> ws(s)://target.
+// Same auth + SSRF guard as HTTP; raw TCP/TLS pipe after the upgrade handshake.
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url, "http://localhost");
+    if (!url.pathname.startsWith(PREFIX) || !isAuthed(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      return socket.destroy();
+    }
+    let target = null;
+    try { target = targetFromPath(url.pathname, url.search, null); } catch { /* malformed */ }
+    if (!target) {
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return socket.destroy();
+    }
+    // Map ws(s) back to http(s) for SSRF checks.
+    const httpTarget = new URL(target.href);
+    httpTarget.protocol = target.protocol === "wss:" ? "https:" : "http:";
+    checkTarget(httpTarget, req);
+    const secure = httpTarget.protocol === "https:";
+    const port = httpTarget.port ? Number(httpTarget.port) : secure ? 443 : 80;
+    const connectOpts = { host: httpTarget.hostname, port, servername: secure ? httpTarget.hostname : undefined };
+    const upstream = secure ? tls.connect(connectOpts) : net.connect(connectOpts);
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+    upstream.on("connect", () => {
+      // Forward the original upgrade request with the real Host.
+      const lines = [`GET ${httpTarget.pathname}${httpTarget.search} HTTP/1.1`, `Host: ${httpTarget.host}`];
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (k.toLowerCase() === "host") continue;
+        lines.push(`${k}: ${v}`);
+      }
+      upstream.write(lines.join("\r\n") + "\r\n\r\n");
+      if (head && head.length) upstream.write(head);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+  } catch {
+    socket.destroy();
+  }
 });
 
 // Render's load balancer reuses connections for longer than Node's 5 second default,
