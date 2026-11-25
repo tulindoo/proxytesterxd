@@ -10,6 +10,8 @@ import { ProxyError, ERRORS, classifyError } from "./src/errors.js";
 import { guardedLookup, checkTarget } from "./src/security.js";
 import { checkRateLimit } from "./src/rateLimit.js";
 import { validateSetCookies } from "./src/cookies.js";
+import { rewriteDash, rewritePlaylist, classifyMedia, applyDashMarkers } from "./src/media.js";
+import { filterDecision, filterStats } from "./src/filtering.js";
 import { isStoreEnabled, getCookieHeader, storeSetCookies, clearSite, clearAll, stats as storeStats } from "./src/sessionStore.js";
 
 const PASSWORD = process.env.PROXY_PASSWORD;
@@ -81,8 +83,7 @@ function proxify(value, base, selfOrigin) {
 function targetFromPath(pathname, search, contextBase) {
   if (isProxiedPath(pathname)) {
     const url = new URL(decodeTarget(pathname.slice(PREFIX.length)));
-    if (search) url.search = url.search ? url.search + "&" + search.slice(1) : search;
-    return url;
+    return applyDashMarkers(url, search);
   }
   return contextBase ? new URL(pathname + search, contextBase) : null;
 }
@@ -115,7 +116,7 @@ function renderErrorPage(info) {
   );
 }
 
-const sharedSource = [encodeTarget, decodeTarget, isProxiedPath, proxify, targetFromPath]
+const sharedSource = [encodeTarget, decodeTarget, isProxiedPath, proxify, applyDashMarkers, targetFromPath]
   .map(String)
   .join("\n");
 const preamble = `const PREFIX = ${JSON.stringify(PREFIX)};\n${sharedSource}\n`;
@@ -229,22 +230,6 @@ function rewriteCss(css, base) {
     });
 }
 
-function rewritePlaylist(text, base) {
-  return text
-    .split(/\r?\n/)
-    .map((line) => {
-      if (!line.trim()) return line;
-      if (line.startsWith("#")) {
-        return line.replace(/URI="([^"]+)"/g, (match, value) => {
-          const out = proxify(value, base);
-          return out === null ? match : `URI="${out}"`;
-        });
-      }
-      return proxify(line, base) ?? line;
-    })
-    .join("\n");
-}
-
 const ATTRIBUTE = /(\s)(href|src|poster|action|formaction|data)=("[^"]*"|'[^']*')/gi;
 const SRCSET = /(\s)srcset=("[^"]*"|'[^']*')/gi;
 const RUNTIME_TAG = '<script src="/runtime.js"></script>';
@@ -297,7 +282,9 @@ function rewriteHtml(html, target, status) {
 function classify(contentType, pathname) {
   if (/text\/html|application\/xhtml\+xml/i.test(contentType)) return "html";
   if (/text\/css/i.test(contentType)) return "css";
-  if (/mpegurl/i.test(contentType) || /\.m3u8$/i.test(pathname)) return "playlist";
+  const media = classifyMedia(contentType, pathname);
+  if (media === "hls") return "playlist";
+  if (media === "dash") return "dash";
   return null;
 }
 
@@ -438,6 +425,11 @@ function requestUpstream(req, res, target, headers) {
 async function handleService(req, res, url) {
   const started = Date.now();
   const entry = { time: new Date().toISOString(), method: req.method, target: "?", status: 0, ms: 0, note: "" };
+  const maxActive = Math.max(8, Number(process.env.PROXY_MAX_ACTIVE) || 64);
+  if (active >= maxActive) {
+    res.writeHead(503, { "retry-after": "2", "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
+    return res.end("Proxy is busy; retry shortly.");
+  }
   active++;
   res.on("close", () => {
     active--;
@@ -457,6 +449,8 @@ async function handleService(req, res, url) {
     if (!target) throw new ProxyError("bad_url", "The path is not a valid proxied address.");
     entry.target = target.host + target.pathname; // no query string: it can hold tokens
     checkTarget(target, req);
+    const filter = filterDecision(target);
+    if (filter.blocked) throw new ProxyError("blocked", `Blocked by controlled filtering lab rule for ${target.hostname}`);
 
     const upstream = await requestUpstream(req, res, target, buildUpstreamHeaders(req, target));
     await respond(req, res, target, upstream, entry);
@@ -549,12 +543,14 @@ async function respond(req, res, target, upstream, entry) {
   const rewritten =
     kind === "html" ? rewriteHtml(text, target, status)
     : kind === "css" ? rewriteCss(text, target.href)
-    : rewritePlaylist(text, target.href);
+    : kind === "playlist" ? rewritePlaylist(text, target.href, proxify)
+    : rewriteDash(text, target.href, proxify);
 
   // The body changed, so the original encoding, length and validators no longer apply.
   for (const name of ["content-encoding", "content-length", "etag", "last-modified"]) delete out[name];
   if (kind === "html") out["content-type"] = "text/html; charset=utf-8";
   if (kind === "css") out["content-type"] = "text/css; charset=utf-8";
+  if (kind === "dash") out["content-type"] = "application/dash+xml; charset=utf-8";
 
   let body = Buffer.from(rewritten, "utf8");
   if (/\bgzip\b/.test(req.headers["accept-encoding"] || "") && body.length > 1024) {
@@ -929,7 +925,7 @@ function runtimeMain() {
       const out = proxify(httpUrl.href, base, ORIGIN);
       if (out === null) return value;
       const proxyProto = location.protocol === "https:" ? "wss:" : "ws:";
-      return proxyProto + "//" + location.host + out + url.search;
+      return proxyProto + "//" + location.host + out;
     };
     window.WebSocket = function (url, protocols) {
       return protocols === undefined ? new NativeWebSocket(pxWs(url)) : new NativeWebSocket(pxWs(url), protocols);
@@ -1156,6 +1152,10 @@ function homeMain() {
   fetch("/cookies").then((r) => r.json()).then((info) => {
     $("serverStore").textContent = info.enabled ? "Server sync enabled (encrypted at rest)" : "Server sync disabled (browser-only)";
   }).catch(() => { $("serverStore").textContent = "Browser-only"; });
+  fetch("/debug.json").then((r) => r.json()).then((info) => {
+    const lab = info.filtering;
+    $("filterMode").textContent = lab.enabled ? `Enabled · ${lab.rules.length} rules · ${lab.blocks} blocks` : "Disabled";
+  }).catch(() => { $("filterMode").textContent = "Disabled"; });
   renderRecent();
 
   startWorker().then(
@@ -1235,6 +1235,7 @@ footer{margin-top:1.5rem;font-size:.9rem;display:flex;gap:1.25rem}
 <div class="row"><span>Search engine</span><select id="engine"><option value="ddg">DuckDuckGo</option><option value="bing">Bing</option><option value="google">Google</option></select></div>
 <div class="row"><span>Saved logins</span><span><span id="cookies">None yet</span> <button type="button" class="plain" id="clear">Clear</button></span></div>
 <div class="row"><span>Session mode</span><span id="serverStore">Checking</span></div>
+<div class="row"><span>Filtering lab</span><span id="filterMode">Checking</span></div>
 <div class="row"><span>Storage</span><span id="storage">Checking</span></div>
 </section>
 <footer><a href="/debug">Request log</a><a href="/logout">Sign out</a></footer>
@@ -1400,7 +1401,7 @@ async function route(req, res) {
     case "/debug": return sendHtml(res, debugHtml());
     case "/debug.json":
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      return res.end(JSON.stringify({ active, uptimeMs: Date.now() - startedAt, entries }));
+      return res.end(JSON.stringify({ active, uptimeMs: Date.now() - startedAt, entries, sessions: storeStats(), filtering: filterStats() }));
     case "/logout":
       res.writeHead(302, { location: "/login", "set-cookie": "proxy_session=; Path=/; HttpOnly; Max-Age=0" });
       return res.end();
@@ -1440,19 +1441,36 @@ server.on("upgrade", (req, socket, head) => {
     const httpTarget = new URL(target.href);
     httpTarget.protocol = target.protocol === "wss:" ? "https:" : "http:";
     checkTarget(httpTarget, req);
+    if (filterDecision(httpTarget).blocked) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return socket.destroy();
+    }
+    const rate = checkRateLimit(req, { limit: 300, windowMs: 60_000 });
+    if (!rate.allowed) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\nRetry-After: " + rate.retryAfter + "\r\nConnection: close\r\n\r\n");
+      return socket.destroy();
+    }
     const secure = httpTarget.protocol === "https:";
     const port = httpTarget.port ? Number(httpTarget.port) : secure ? 443 : 80;
-    const connectOpts = { host: httpTarget.hostname, port, servername: secure ? httpTarget.hostname : undefined };
+    // Socket-level lookup guard prevents DNS rebinding between validation and connect.
+    const connectOpts = { host: httpTarget.hostname, port, servername: secure ? httpTarget.hostname : undefined, lookup: guardedLookup };
     const upstream = secure ? tls.connect(connectOpts) : net.connect(connectOpts);
     upstream.on("error", () => socket.destroy());
     socket.on("error", () => upstream.destroy());
-    upstream.on("connect", () => {
-      // Forward the original upgrade request with the real Host.
-      const lines = [`GET ${httpTarget.pathname}${httpTarget.search} HTTP/1.1`, `Host: ${httpTarget.host}`];
-      for (const [k, v] of Object.entries(req.headers)) {
-        if (k.toLowerCase() === "host") continue;
-        lines.push(`${k}: ${v}`);
+    upstream.on(secure ? "secureConnect" : "connect", () => {
+      // Forward only WebSocket handshake headers. Never leak proxy_session or
+      // unrelated proxy-origin cookies/headers to the destination.
+      const lines = [
+        `GET ${httpTarget.pathname}${httpTarget.search} HTTP/1.1`,
+        `Host: ${httpTarget.host}`,
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+      ];
+      for (const name of ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"]) {
+        const value = req.headers[name];
+        if (value) lines.push(`${name}: ${value}`);
       }
+      lines.push(`Origin: ${httpTarget.origin}`);
       upstream.write(lines.join("\r\n") + "\r\n\r\n");
       if (head && head.length) upstream.write(head);
       upstream.pipe(socket);

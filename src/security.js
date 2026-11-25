@@ -35,18 +35,21 @@ export function isPrivate(ip) {
     );
   }
   if (!net.isIPv6(ip)) return false;
-  const v = ip.toLowerCase();
-  // IPv4-mapped (incl. hex form ::ffff:7f00:1) can hide a private IPv4 — reject whole range.
-  if (v.startsWith("::ffff:")) return true;
-  if (v === "::1" || v === "::") return true;
-  // fc00::/7 unique-local (fc*, fd*)
+  let v = ip.toLowerCase();
+  // Canonicalize expanded literals so mapped/private prefix checks cannot be bypassed.
+  try { v = new URL(`http://[${v}]/`).hostname.replace(/^\[|\]$/g, ""); } catch { /* keep parser input */ }
+  // Unspecified, loopback, IPv4-compatible, and IPv4-mapped forms are never destinations.
+  if (v === "::" || v === "::1" || v.startsWith("::ffff:") || (v.startsWith("::") && v !== "::")) return true;
+  // fc00::/7 unique-local (fc*, fd*).
   if (v.startsWith("fc") || v.startsWith("fd")) return true;
-  // fe80::/10 link-local: fe8, fe9, fea, feb
-  if (v.startsWith("fe8") || v.startsWith("fe9") || v.startsWith("fea") || v.startsWith("feb")) return true;
-  // 2001:db8::/32 documentation
-  if (v.startsWith("2001:db8:")) return true;
-  // Expanded loopback forms
-  if (v === "0:0:0:0:0:0:0:1") return true;
+  // fe80::/10 link-local and fec0::/10 deprecated site-local.
+  if (["fe8", "fe9", "fea", "feb", "fec"].some((prefix) => v.startsWith(prefix))) return true;
+  // Multicast, documentation, protocol-assignment, benchmarking, and ORCHID ranges.
+  if (v.startsWith("ff") || v.startsWith("2001:db8:") || v.startsWith("2001::") || v.startsWith("2001:0:") || v.startsWith("2001:2:") || v.startsWith("2001:10:")) return true;
+  // 2002::/16 embeds IPv4 (6to4); 64:ff9b::/96 is NAT64 translation.
+  if (v.startsWith("2002:") || v.startsWith("64:ff9b:")) return true;
+  // 100::/64 is the discard-only range.
+  if (v.startsWith("100:")) return true;
   return false;
 }
 

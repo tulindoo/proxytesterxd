@@ -27,9 +27,9 @@ test("isPrivate allows public IPv4", () => {
 
 test("isPrivate blocks IPv6 private/reserved incl. fe80::/10 and mapped", () => {
   const blocked = ["::1", "::", "::ffff:127.0.0.1", "::ffff:7f00:1", "::ffff:0a00:0001",
-    "fc00::1", "fd00::1", "fe80::1", "fe90::1", "fea0::1", "febf::1", "2001:db8::1", "0:0:0:0:0:0:0:1"];
+    "0:0:0:0:0:ffff:7f00:1", "fc00::1", "fd00::1", "fe80::1", "fe90::1", "fea0::1", "febf::1", "fec0::1", "ff02::1", "2001:db8::1", "2001:2::1", "2001:0::1", "2002:7f00:1::1", "64:ff9b::7f00:1", "0:0:0:0:0:0:0:1"];
   for (const ip of blocked) assert.equal(isPrivate(ip), true, ip);
-  for (const ip of ["2606:4700:4700::1111", "2001:4860:4860::8888", "fec0::1"]) {
+  for (const ip of ["2606:4700:4700::1111", "2001:4860:4860::8888"]) {
     assert.equal(isPrivate(ip), false, ip);
   }
 });
