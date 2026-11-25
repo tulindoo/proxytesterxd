@@ -1318,7 +1318,10 @@ function sendHtml(res, html, status = 200) {
 }
 
 function sendScript(res, source) {
-  res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'" });
+  // Service-worker fetch() requests are governed by the worker script's CSP.
+  // Allow same-origin API/proxy fetches, otherwise the SW reports TypeError and
+  // the browser shows the offline fallback without any request reaching Node.
+  res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; connect-src 'self'" });
   res.end(source);
 }
 
