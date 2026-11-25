@@ -11,7 +11,7 @@ npm install
 PROXY_PASSWORD='use-a-long-unique-secret' npm start
 ```
 
-Open the service URL and sign in with `PROXY_PASSWORD`. For HTTPS deployments, terminate TLS at the trusted host/proxy. Do not expose an unauthenticated instance to the public Internet. Keep the login secret private and rotate it if exposed.
+Open the service URL and sign in with `PROXY_PASSWORD`. For HTTPS deployments, terminate TLS at the trusted host/proxy. On Render, configure the service health-check path as `/healthz` so the platform can detect when the application is responding. Do not expose an unauthenticated instance to the public Internet. Keep the login secret private and rotate it if exposed.
 
 ## Configuration
 

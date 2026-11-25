@@ -93,9 +93,10 @@ function renderErrorPage(info) {
     String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   const fixes = (info.fixes || []).map((f) => "<li>" + esc(f) + "</li>").join("");
   const retry = info.retry
-    ? "<p id=retry>Retrying automatically.</p><script>var n=+sessionStorage.getItem('proxy-retry')||0;" +
-      "if(n<8){sessionStorage.setItem('proxy-retry',n+1);setTimeout(function(){location.reload()},8000)}" +
-      "else{document.getElementById('retry').textContent='Stopped retrying. Reload when you are ready.'}<\/script>"
+    ? "<p id=retry>Trying again automatically.</p><script>(function(){var n=1;try{n=(Number(sessionStorage.getItem('proxy-retry'))||0)+1;sessionStorage.setItem('proxy-retry',String(Math.min(n,1000)))}catch(e){}" +
+      "var delay=Math.min(30000,4000*Math.pow(1.5,Math.min(n-1,8)));var p=document.getElementById('retry');" +
+      "p.textContent='Could not reach the proxy. Retrying in '+Math.ceil(delay/1000)+' seconds (attempt '+n+').';" +
+      "setTimeout(function(){location.reload()},delay)})()<\/script>"
     : "";
   return (
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>" +
@@ -567,7 +568,7 @@ async function respond(req, res, target, upstream, entry) {
    ========================================================================== */
 
 function swMain() {
-  const INTERNAL = new Set(["/", "/sw.js", "/runtime.js", "/login", "/logout", "/debug", "/debug.json", "/favicon.ico"]);
+  const INTERNAL = new Set(["/", "/sw.js", "/runtime.js", "/login", "/logout", "/debug", "/debug.json", "/cookies", "/healthz", "/favicon.ico"]);
   const DAY = 86400000;
   // Redirect hop counts per target URL (cleared on non-redirect responses).
   const redirectCounts = new Map();
@@ -803,6 +804,7 @@ const swSource = `${preamble}${renderErrorPage}\n(${swMain})();\n`;
    ========================================================================== */
 
 function runtimeMain() {
+  try { sessionStorage.removeItem("proxy-retry"); } catch { /* storage can be disabled */ }
   const ORIGIN = location.origin;
 
   const current = () => {
@@ -1048,6 +1050,7 @@ const runtimeSource = `${preamble}(${runtimeMain})();\n`;
    ========================================================================== */
 
 function homeMain() {
+  try { sessionStorage.removeItem("proxy-retry"); } catch { /* storage can be disabled */ }
   const $ = (id) => document.getElementById(id);
   const ENGINES = {
     ddg: "https://html.duckduckgo.com/html/?q=%s",
@@ -1349,6 +1352,10 @@ async function route(req, res) {
   const path = url.pathname;
 
   if (path === "/login") return handleLogin(req, res, url);
+  if (path === "/healthz") {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+    return res.end("ok");
+  }
 
   if (!isAuthed(req)) {
     if (path.startsWith(PREFIX)) {
