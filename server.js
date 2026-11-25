@@ -10,6 +10,7 @@ import { ProxyError, ERRORS, classifyError } from "./src/errors.js";
 import { guardedLookup, checkTarget } from "./src/security.js";
 import { checkRateLimit } from "./src/rateLimit.js";
 import { validateSetCookies } from "./src/cookies.js";
+import { isStoreEnabled, getCookieHeader, storeSetCookies, clearSite, clearAll, stats as storeStats } from "./src/sessionStore.js";
 
 const PASSWORD = process.env.PROXY_PASSWORD;
 if (!PASSWORD) {
@@ -356,6 +357,23 @@ const BLOCKED_REQUEST = new Set([
   "transfer-encoding", "upgrade", "te", "keep-alive", "proxy-authorization", "proxy-connection",
 ]);
 
+function mergeCookies(a, b) {
+  const map = new Map();
+  for (const part of (a || "").split(";")) {
+    const t = part.trim();
+    if (!t) continue;
+    const eq = t.indexOf("=");
+    if (eq > 0) map.set(t.slice(0, eq).trim(), t);
+  }
+  for (const part of (b || "").split(";")) {
+    const t = part.trim();
+    if (!t) continue;
+    const eq = t.indexOf("=");
+    if (eq > 0) map.set(t.slice(0, eq).trim(), t);
+  }
+  return [...map.values()].join("; ");
+}
+
 function buildUpstreamHeaders(req, target) {
   let fromPage = {};
   try {
@@ -374,7 +392,12 @@ function buildUpstreamHeaders(req, target) {
     const key = name.toLowerCase();
     if (!BLOCKED_REQUEST.has(key) && !key.startsWith("x-proxy-") && !key.startsWith("sec-")) headers[key] = String(value);
   }
-  if (req.headers["x-proxy-cookie"]) headers.cookie = req.headers["x-proxy-cookie"];
+  // Cookie merge: SW jar (per-browser) + optional server store (multi-device).
+  // Server store wins on name conflicts (it reflects the latest Set-Cookie).
+  const swCookie = req.headers["x-proxy-cookie"] || "";
+  const serverCookie = isStoreEnabled() ? getCookieHeader(target) : "";
+  const merged = mergeCookies(swCookie, serverCookie);
+  if (merged) headers.cookie = merged;
 
   const writes = req.method !== "GET" && req.method !== "HEAD";
   let referer = null;
@@ -462,7 +485,10 @@ async function respond(req, res, target, upstream, entry) {
   const setCookies = upstream.headers["set-cookie"];
   if (setCookies?.length) {
     const valid = await validateSetCookies(target.href, setCookies);
-    if (valid.length) out["x-proxy-set-cookie"] = encodeURIComponent(JSON.stringify(valid));
+    if (valid.length) {
+      out["x-proxy-set-cookie"] = encodeURIComponent(JSON.stringify(valid));
+      if (isStoreEnabled()) storeSetCookies(target, valid);
+    }
   }
 
   // Redirects become a normal reply with extra headers. The service worker turns them back
@@ -584,6 +610,8 @@ function swMain() {
       hostOnly: true,
       path: "/",
       secure: false,
+      sameSite: "Lax",
+      partitioned: false,
       expires: Date.now() + 30 * DAY, // session cookies are kept 30 days so logins survive closing the browser
     };
     let maxAge = null;
@@ -601,6 +629,8 @@ function swMain() {
         }
       } else if (key === "path" && value.startsWith("/")) cookie.path = value;
       else if (key === "secure") cookie.secure = true;
+      else if (key === "samesite") cookie.sameSite = ["lax", "strict", "none"].includes(value.toLowerCase()) ? value : "Lax";
+      else if (key === "partitioned") cookie.partitioned = true;
       else if (key === "max-age") {
         const n = parseInt(value, 10);
         if (!Number.isNaN(n)) maxAge = n;
@@ -611,6 +641,9 @@ function swMain() {
     }
     if (maxAge !== null) cookie.expires = Date.now() + maxAge * 1000;
     else if (expiresAt !== null) cookie.expires = expiresAt;
+    if (cookie.name.startsWith("__Host-") && (!cookie.secure || !cookie.hostOnly || cookie.path !== "/")) return null;
+    if (cookie.name.startsWith("__Secure-") && !cookie.secure) return null;
+    if (cookie.partitioned && !cookie.secure) return null;
     cookie.id = cookie.domain + "|" + cookie.path + "|" + cookie.name;
     return cookie;
   }
@@ -1115,9 +1148,14 @@ function homeMain() {
     settings.engine = $("engine").value;
     write("settings", settings);
   });
-  $("clear").addEventListener("click", () => {
+  $("clear").addEventListener("click", async () => {
     if (navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage({ type: "cookies:clear" });
+    try { await fetch("/cookies", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "" }); } catch { /* SW-only mode or endpoint unavailable */ }
+    setTimeout(() => location.reload(), 250);
   });
+  fetch("/cookies").then((r) => r.json()).then((info) => {
+    $("serverStore").textContent = info.enabled ? "Server sync enabled (encrypted at rest)" : "Server sync disabled (browser-only)";
+  }).catch(() => { $("serverStore").textContent = "Browser-only"; });
   renderRecent();
 
   startWorker().then(
@@ -1196,6 +1234,7 @@ footer{margin-top:1.5rem;font-size:.9rem;display:flex;gap:1.25rem}
 <div class="row"><span>Service worker</span><span id="sw"><span class="dot"></span>Starting</span></div>
 <div class="row"><span>Search engine</span><select id="engine"><option value="ddg">DuckDuckGo</option><option value="bing">Bing</option><option value="google">Google</option></select></div>
 <div class="row"><span>Saved logins</span><span><span id="cookies">None yet</span> <button type="button" class="plain" id="clear">Clear</button></span></div>
+<div class="row"><span>Session mode</span><span id="serverStore">Checking</span></div>
 <div class="row"><span>Storage</span><span id="storage">Checking</span></div>
 </section>
 <footer><a href="/debug">Request log</a><a href="/logout">Sign out</a></footer>
@@ -1330,6 +1369,24 @@ async function route(req, res) {
       return res.end("Too many requests. Try again later.");
     }
     return handleService(req, res, url);
+  }
+
+  if (path === "/cookies") {
+    if (req.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(JSON.stringify(storeStats()));
+    }
+    if (req.method === "POST") {
+      const body = await readSmallBody(req);
+      const params = new URLSearchParams(body);
+      const site = params.get("site");
+      if (site) clearSite(site);
+      else clearAll();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, ...storeStats() }));
+    }
+    res.writeHead(405);
+    return res.end("Method not allowed");
   }
 
   if (req.method !== "GET" && req.method !== "HEAD") {
